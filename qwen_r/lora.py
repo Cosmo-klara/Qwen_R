@@ -14,6 +14,57 @@ from transformers.models.qwen2_vl.video_processing_qwen2_vl import Qwen2VLVideoP
 from transformers.video_utils import VideoMetadata
 from typing import Optional
 
+import json
+from torch.utils.data import Dataset
+
+class OmniVideoConversationDataset(Dataset):
+    def __init__(
+        self,
+        json_path: str,
+        video_root: str,
+    ):
+        with open(json_path, "r") as f:
+            self.data = json.load(f)
+
+        self.video_root = video_root
+
+    def __len__(self):
+        return len(self.data)
+
+    def _build_text(self, conversations):
+        messages = []
+        for turn in conversations:
+            if turn["from"] == "human":
+                role = "user"
+            elif turn["from"] == "gpt":
+                role = "assistant"
+            else:
+                continue
+
+            messages.append({
+                "role": role,
+                "content": turn["value"]
+            })
+
+        return messages
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        messages = self._build_text(sample["conversations"])
+        video_id = sample["id"]
+        video_path = os.path.join(self.video_root, f"{video_id}.mp4")
+
+        return {
+            "text": messages,
+            "videos": [video_path],
+        }
+
+train_dataset = OmniVideoConversationDataset(
+    json_path="../../LongVALE/data/longvale-sft-bp-7k.json",
+    video_root="../../LongVALE/raw_videos_train"
+)
+
+
 class FixedFrameQwen2VLVideoProcessor(Qwen2VLVideoProcessor):
     def __init__(self, num_frames=100, **kwargs):
         super().__init__(**kwargs)
