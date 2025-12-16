@@ -16,7 +16,10 @@ model_path = snapshot_download(
     cache_dir="./cache/modelscope"
 )
 
-train_dataset = load_dataset("ttgeng233/LongVALE")
+# 无法使用
+# train_dataset = load_dataset("ttgeng233/LongVALE")
+
+
 
 model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
     model_path,
@@ -45,7 +48,6 @@ config = LoraConfig(
     target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
     lora_dropout=0.1,
     bias="none",
-    modules_to_save=["classifier"],
 )
 
 model = get_peft_model(model, config)
