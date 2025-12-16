@@ -16,7 +16,7 @@ model_path = snapshot_download(
     cache_dir="./cache/modelscope"
 )
 
-train_dataset = load_dataset("huggingface/cats-image")
+train_dataset = load_dataset("ttgeng233/LongVALE")
 
 model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
     model_path,
@@ -42,7 +42,7 @@ processor = Qwen2_5OmniProcessor.from_pretrained(model_path, trust_remote_code=T
 config = LoraConfig(
     r=16,
     lora_alpha=16,
-    target_modules=["query", "value"],
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
     lora_dropout=0.1,
     bias="none",
     modules_to_save=["classifier"],
@@ -71,10 +71,10 @@ args = TrainingArguments(
 
 trainer = Trainer(
     model=model.thinker,
+    # model=model,
     args=args,
     train_dataset=train_dataset,
-    processing_class=image_processor,
-    data_collator=collate_fn,
+    processing_class=processor
 )
 
 

@@ -57,7 +57,7 @@ def preprocess_train(example_batch):
 def preprocess_val(example_batch):
     example_batch["pixel_values"] = [val_transforms(image.convert("RGB")) for image in example_batch["image"]]
     return example_batch
-    
+
 train_ds = ds["train"]
 val_ds = ds["validation"]
 
