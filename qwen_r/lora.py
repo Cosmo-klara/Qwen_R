@@ -75,17 +75,17 @@ batch_size = 32
 args = TrainingArguments(
     output_dir="./r_models",
     remove_unused_columns=False,
-    eval_strategy="epoch",
+    eval_strategy="no",
     save_strategy="epoch",
     learning_rate=2e-4,
     per_device_train_batch_size=batch_size,
     gradient_accumulation_steps=4,
-    per_device_eval_batch_size=batch_size,
+    # per_device_eval_batch_size=batch_size,
     bf16=True,
     num_train_epochs=3, # 5 -> 2
     logging_steps=10,
     save_steps=100,
-    load_best_model_at_end=True,
+    load_best_model_at_end=False,
     label_names=["labels"],
 )
 
