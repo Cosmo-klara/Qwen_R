@@ -1,7 +1,7 @@
 import os
 os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
 os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
 
 import torch
 from datasets import load_dataset
@@ -41,76 +41,59 @@ class FixedFrameQwen2VLVideoProcessor(Qwen2VLVideoProcessor):
 
 model_path = snapshot_download(
     'Qwen/Qwen2.5-Omni-3B',
-    cache_dir="./cache/modelscope"
+    cache_dir="../../Qwen/cache/modelscope"
 )
 
-# 无法使用
-# train_dataset = load_dataset("ttgeng233/LongVALE")
-
-
-
-model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
     model_path,
     torch_dtype=torch.bfloat16,
     device_map="cuda:1",
     trust_remote_code=True,
-    enable_audio_output=False,
     use_safetensors=True
 )
 
-# model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-#     model_path,
-#     torch_dtype=torch.bfloat16,
-#     device_map="cuda:1",
-#     trust_remote_code=True,
-#     enable_audio_output=False,
-#     use_safetensors=True
-# )
-
-
-# processor = Qwen2_5OmniProcessor.from_pretrained(model_path, trust_remote_code=True)
-
-video_processor = FixedFrameQwen2VLVideoProcessor.from_pretrained(model_dir)
+video_processor = FixedFrameQwen2VLVideoProcessor.from_pretrained(model_path)
 processor = Qwen2_5OmniProcessor.from_pretrained(
-    model_dir,
+    model_path,
     video_processor=video_processor,
 )
 
 config = LoraConfig(
     r=16,
     lora_alpha=16,
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-    lora_dropout=0.1,
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "up_proj", "down_proj"],
+    # target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
     bias="none",
 )
 
 model = get_peft_model(model, config)
 model.print_trainable_parameters()
 
-batch_size = 128
+batch_size = 32
 
 args = TrainingArguments(
     output_dir="./r_models",
     remove_unused_columns=False,
     eval_strategy="epoch",
     save_strategy="epoch",
-    learning_rate=5e-3,
+    learning_rate=2e-4,
     per_device_train_batch_size=batch_size,
     gradient_accumulation_steps=4,
     per_device_eval_batch_size=batch_size,
     bf16=True,
-    num_train_epochs=2, # 5 -> 2
+    num_train_epochs=3, # 5 -> 2
     logging_steps=10,
+    save_steps=100,
     load_best_model_at_end=True,
     label_names=["labels"],
 )
 
 trainer = Trainer(
-    model=model.thinker,
-    # model=model,
+    # model=model.thinker,
+    model=model,
     args=args,
     train_dataset=train_dataset,
     processing_class=processor
 )
-
 
