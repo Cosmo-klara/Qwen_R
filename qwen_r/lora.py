@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,4,5,6"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,7"
 import torch
 
 from transformers import TrainingArguments, Trainer
@@ -24,7 +24,7 @@ class FixedResQwen2VLVideoProcessor(Qwen2VLVideoProcessor):
         for i, video in enumerate(videos):
             videos[i] = self.resize(video, size=fixed_size, interpolation=interpolation)
         return super()._preprocess(videos, do_resize=False, size=fixed_size, interpolation=interpolation, **kwargs)
-
+        
 class OmniVideoConversationDataset(Dataset):
     def __init__(
         self,
@@ -85,43 +85,68 @@ class OmniVideoConversationDataset(Dataset):
 
         return {"conversation": conversation}
 
-
-
 class QwenOmniDataCollator:
     def __init__(self, processor):
         self.processor = processor
+        self.tokenizer = processor.tokenizer
 
     def __call__(self, features):
         texts = []
-        all_videos = []
-        all_audios = []
+        videos = []
+        audios = []
+        labels_list = []
 
         for f in features:
             conversation = f["conversation"]
 
-            text = self.processor.apply_chat_template(
+            # ---------- 1. 拼完整 prompt ----------
+            full_text = self.processor.apply_chat_template(
                 conversation,
-                add_generation_prompt=False,
                 tokenize=False,
+                add_generation_prompt=False,
             )
+
+            # ---------- 2. 构造 labels（后缀 assistant） ----------
+            assistant_text = conversation[-1]["content"][0]["text"]
+
+            full_ids = self.tokenizer(
+                full_text,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            assistant_ids = self.tokenizer(
+                assistant_text,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            labels = [-100] * len(full_ids)
+            labels[-len(assistant_ids):] = assistant_ids
+
+            texts.append(full_text)
+            labels_list.append(labels)
+
+            # ---------- 3. 多模态 ----------
             for msg in conversation:
                 if msg["role"] == "user":
                     for ele in msg["content"]:
                         if ele.get("type") == "video":
-                            ele["fps"] = 0.5   # 设置 1fps
+                            ele["fps"] = 0.5
+                            ele["max_frames"] = 50
+                            ele["min_pixels"] = 64 * 28 * 28
+                            ele["max_pixels"] = 64 * 28 * 28
 
-            audios, images, videos = process_mm_info(
+            audios_, _, videos_ = process_mm_info(
                 conversation, use_audio_in_video=True
             )
 
-            texts.append(text)
-            all_videos.append(videos[0] if videos else None)
-            all_audios.append(audios[0] if audios else None)
+            videos.append(videos_[0] if videos_ else None)
+            audios.append(audios_[0] if audios_ else None)
 
+        # ---------- 4. 一次性 processor ----------
         batch = self.processor(
             text=texts,
-            videos=all_videos,
-            audio=all_audios,
+            videos=videos,
+            audio=audios,
             padding=True,
             return_tensors="pt",
             use_audio_in_video=True,
@@ -132,6 +157,17 @@ class QwenOmniDataCollator:
         for k, v in batch.items(): 
             if isinstance(v, torch.Tensor): 
                 print(k, v.shape, v.numel() * v.element_size() / 1024**3, "GB")
+
+
+        # ---------- 5. pad labels ----------
+        max_len = batch["input_ids"].shape[1]
+        padded_labels = []
+
+        for lab in labels_list:
+            padded = lab + [-100] * (max_len - len(lab))
+            padded_labels.append(padded)
+
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
 
         return batch
 
@@ -154,6 +190,14 @@ model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
     use_safetensors=True
 )
 
+# model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+#     model_path,
+#     dtype=torch.bfloat16,
+#     device_map="balanced",
+#     trust_remote_code=True,
+#     use_safetensors=True
+# )
+# model = model.thinker
 
 video_processor = FixedResQwen2VLVideoProcessor.from_pretrained(model_path)
 
@@ -183,6 +227,7 @@ for name, param in model.named_parameters():
 model.gradient_checkpointing_enable()
 model.config.use_cache = False
 
+
 model.print_trainable_parameters()
 
 batch_size = 1
@@ -197,6 +242,7 @@ args = TrainingArguments(
     gradient_accumulation_steps=2,
     # per_device_eval_batch_size=batch_size,
     bf16=True,
+    fp16=False,
     num_train_epochs=2, # 5 -> 2
     logging_steps=5,
     load_best_model_at_end=False,
@@ -213,3 +259,4 @@ trainer = Trainer(
 )
 
 trainer.train()
+
