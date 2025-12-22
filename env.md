@@ -13,4 +13,5 @@ pip install flash_attn-2.7.1.post4+cu11torch2.6cxx11abiFALSE-cp310-cp310-linux_x
 pip install ipywidgets
 conda install datasets
 pip install peft
+pip install 'qwen-omni-utils[decord]' -U
 ```
