@@ -41,6 +41,7 @@ class OmniVideoConversationDataset(Dataset):
         for item in raw_data:
             video_id = item["id"]
             video_path = os.path.join(video_root, f"{video_id}.mp4")
+            audio_path = video_path.replace(".mp4", ".wav")
 
             convs = item["conversations"]
             meta = item.get("meta", {})
@@ -55,6 +56,7 @@ class OmniVideoConversationDataset(Dataset):
 
                 self.samples.append({
                     "video_path": video_path,
+                    "audio_path": audio_path,
                     "question": convs[i]["value"],
                     "answer": convs[i + 1]["value"],
                     "duration": duration,
@@ -84,7 +86,6 @@ class OmniVideoConversationDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-
         conversation = [
             {
                 "role": "system",
@@ -96,6 +97,7 @@ class OmniVideoConversationDataset(Dataset):
                 "role": "user",
                 "content": [
                     {"type": "video", "video": s["video_path"]},
+                    {"type": "audio", "audio": s["audio_path"]},
                     {"type": "text", "text": s["question"]},
                 ],
             },
@@ -118,6 +120,7 @@ class QwenOmniDataCollator:
     def __init__(self, processor):
         self.processor = processor
         self.tokenizer = processor.tokenizer
+        self.video_cache = {}
 
     def __call__(self, features):
         texts = []
@@ -154,15 +157,33 @@ class QwenOmniDataCollator:
                         if ele.get("type") == "video":
                             ele["fps"] = 0.5
                             ele["max_frames"] = 50
-                            # ele["min_pixels"] = 64 * 28 * 28
-                            # ele["max_pixels"] = 64 * 28 * 28
 
-            audios_, _, videos_ = process_mm_info(
-                conversation, use_audio_in_video=True
-            )
+                            video_path = ele["video"]
 
-            videos.append(videos_[0] if videos_ else None)
-            audios.append(audios_[0] if audios_ else None)
+                            # ---------- 使用缓存 ----------
+                            if video_path not in self.video_cache:
+                                audios_, _, videos_ = process_mm_info(
+                                    conversation, use_audio_in_video=False
+                                )
+                                self.video_cache[video_path] = {
+                                    "video": videos_[0] if videos_ else None,
+                                    "audio": audios_[0] if audios_ else None,
+                                }
+
+                            video_tensor = self.video_cache[video_path]["video"]
+                            audio_tensor = self.video_cache[video_path]["audio"]
+
+
+            # audios_, _, videos_ = process_mm_info(
+            #     conversation, use_audio_in_video=True
+            # )
+
+            # videos.append(videos_[0] if videos_ else None)
+            # audios.append(audios_[0] if audios_ else None)
+
+            videos.append(video_tensor)
+            audios.append(audio_tensor)
+
 
         # ---------- 4. 一次性 processor ----------
         batch = self.processor(
@@ -171,7 +192,7 @@ class QwenOmniDataCollator:
             audio=audios,
             padding=True,
             return_tensors="pt",
-            use_audio_in_video=True
+            use_audio_in_video=False
         )
 
 
@@ -207,14 +228,14 @@ class QwenOmniDataCollator:
 
         batch["labels"] = labels
 
-        # print(batch["labels"])
+        print(batch["labels"])
 
-        # print(batch["video_grid_thw"].shape) 
+        print(batch["video_grid_thw"].shape) 
 
-        # print(batch["pixel_values_videos"].shape) 
-        # for k, v in batch.items(): 
-        #     if isinstance(v, torch.Tensor): 
-        #         print(k, v.shape, v.numel() * v.element_size() / 1024**3, "GB")
+        print(batch["pixel_values_videos"].shape) 
+        for k, v in batch.items(): 
+            if isinstance(v, torch.Tensor): 
+                print(k, v.shape, v.numel() * v.element_size() / 1024**3, "GB")
 
         return batch
 
