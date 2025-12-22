@@ -1,5 +1,6 @@
-vit_r/r_models/
+vit_r/r_models/*
 
+# qwen_r/r_models/*
 __pycache__/
 *.pyc
 
