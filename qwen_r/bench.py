@@ -1,8 +1,8 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-
+import copy
 from transformers import TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model
 from modelscope import snapshot_download
@@ -29,215 +29,197 @@ def replace_time_tokens_with_percentage(text, time_map, duration):
 
     return re.sub(r"<s\d+>|<e\d+>", repl, text)
 
-
 class OmniVideoConversationDataset(Dataset):
     def __init__(self, json_path: str, video_root: str):
         with open(json_path, "r") as f:
-            raw_data = json.load(f)
+            self.raw_data = json.load(f)
 
         self.video_root = video_root
-        self.samples = []
-
-        for item in raw_data:
-            video_id = item["id"]
-            video_path = os.path.join(video_root, f"{video_id}.mp4")
-            audio_path = video_path.replace(".mp4", ".wav")
-
-            convs = item["conversations"]
-            meta = item.get("meta", {})
-            duration = meta.get("duration", None)
-            time_map = meta.get("token", {})
-            
-
-            # 遍历 human / gpt 成对
-            for i in range(0, len(convs) - 1, 2):
-                if convs[i]["from"] != "human" or convs[i + 1]["from"] != "gpt":
-                    continue
-
-                self.samples.append({
-                    "video_path": video_path,
-                    "audio_path": audio_path,
-                    "question": convs[i]["value"],
-                    "answer": convs[i + 1]["value"],
-                    "duration": duration,
-                    "time_map": time_map,
-                })
 
     def __len__(self):
-        return len(self.samples)
-
-
-    def _build_text(self, conversations):
-        messages = []
-        for turn in conversations:
-            if turn["from"] == "human":
-                role = "user"
-            elif turn["from"] == "gpt":
-                role = "assistant"
-            else:
-                continue
-
-            messages.append({
-                "role": role,
-                "content": turn["value"]
-            })
-
-        return messages
+        return len(self.raw_data)
 
     def __getitem__(self, idx):
-        s = self.samples[idx]
-        conversation = [
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."}
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "video", "video": s["video_path"]},
-                    {"type": "audio", "audio": s["audio_path"]},
-                    {"type": "text", "text": s["question"]},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": s["answer"]},
-                ],
-            },
-        ]
+        item = self.raw_data[idx]
+
+        video_id = item["id"]
+        video_path = os.path.join(self.video_root, f"{video_id}.mp4")
+        audio_path = video_path.replace(".mp4", ".wav")
+
+        duration = item.get("meta", {}).get("duration", None)
+        time_map = item.get("meta", {}).get("token", {})
 
         return {
-            "conversation": conversation,
-            "duration": s["duration"],
-            "time_map": s["time_map"],
-            }
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "conversations": copy.deepcopy(item["conversations"]),
+            "duration": duration,
+            "time_map": time_map,
+        }
 
 
 class QwenOmniDataCollator:
     def __init__(self, processor):
         self.processor = processor
         self.tokenizer = processor.tokenizer
-        self.video_cache = {}
 
+    def _replace_time_tokens(self, conversations, time_map, duration):
+        if not time_map or duration is None:
+            return conversations
+
+        def repl(match):
+            token = match.group(0)
+            if token not in time_map:
+                return token
+            pct = time_map[token] / duration * 100
+            return f"{pct:.1f}%"
+
+        for turn in conversations:
+            turn["value"] = re.sub(r"<s\d+>|<e\d+>", repl, turn["value"])
+        return conversations
+    
+    def _split_rounds(self, conversations):
+        rounds = []
+        cur = []
+        for turn in conversations:
+            cur.append(turn)
+            if turn["from"] == "gpt":
+                rounds.append(cur)
+                cur = []
+        return rounds
+
+    def _truncate_by_round(
+        self,
+        base_chat,          # system + video/audio
+        rounds,             # [[h,g], [h,g], ...]
+        max_length
+    ):
+        while True:
+            chat = copy.deepcopy(base_chat)
+
+            for r in rounds:
+                for t in r:
+                    role = "user" if t["from"] == "human" else "assistant"
+                    chat.append({
+                        "role": role,
+                        "content": [{"type": "text", "text": t["value"]}],
+                    })
+
+            prompt = self.processor.apply_chat_template(
+                chat, tokenize=False, add_generation_prompt=False
+            )
+
+            token_len = len(self.tokenizer(prompt).input_ids)
+
+            if token_len <= max_length or len(rounds) <= 1:
+                return chat
+
+            # ❗ 删除最早的一整轮
+            rounds = rounds[1:]
+
+    def _build_conversation(self, sample):
+        conversations = self._replace_time_tokens(
+            sample["conversations"],
+            sample["time_map"],
+            sample["duration"],
+        )
+
+        base_chat = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": sample["video_path"], "fps": 0.5, "max_frames": 50},
+                    {"type": "audio", "audio": sample["audio_path"]},
+                ],
+            },
+        ]
+
+        rounds = self._split_rounds(conversations)
+
+        chat = self._truncate_by_round(
+            base_chat=base_chat,
+            rounds=rounds,
+            max_length=self.tokenizer.model_max_length,
+        )
+
+        return chat
+
+
+    def _build_labels(self, input_ids):
+        labels = input_ids.clone()
+        labels[:] = -100
+
+        im_start = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assistant = self.tokenizer.convert_tokens_to_ids("assistant")
+
+        i = 0
+        while i < len(input_ids) - 1:
+            if input_ids[i] == im_start and input_ids[i + 1] == assistant:
+                j = i + 3  # skip <|im_start|> assistant \n
+                while j < len(input_ids) and input_ids[j] != im_end:
+                    labels[j] = input_ids[j]
+                    j += 1
+                i = j
+            else:
+                i += 1
+        return labels
+
+    
     def __call__(self, features):
-        texts = []
-        videos = []
-        audios = []
+        texts, videos, audios = [], [], []
 
-        for f in features:
-            conversation = f["conversation"]
+        for sample in features:
+            conversation = self._build_conversation(sample)
 
-            for msg in conversation:
-                if msg["role"] in ("user", "assistant"):
-                    for ele in msg["content"]:
-                        if ele.get("type") == "text":
-                            ele["text"] = replace_time_tokens_with_percentage(
-                                ele["text"],
-                                f["time_map"],
-                                f["duration"],
-                            )
-
-            # ---------- 1. 拼完整 prompt ----------
-            full_text = self.processor.apply_chat_template(
+            prompt = self.processor.apply_chat_template(
                 conversation,
                 tokenize=False,
                 add_generation_prompt=False,
             )
+            texts.append(prompt)
 
-            # ---------- 2. 构造 labels（后缀 assistant） ----------
-            texts.append(full_text)
+            # video_path = sample["video_path"]
+            # if video_path not in self.video_cache:
+            #     audios_, _, videos_ = process_mm_info(
+            #         conversation, use_audio_in_video=False
+            #     )
+            #     self.video_cache[video_path] = {
+            #         "video": videos_[0],
+            #         "audio": audios_[0],
+            #     }
 
-            # ---------- 3. 多模态 ----------
-            for msg in conversation:
-                if msg["role"] == "user":
-                    for ele in msg["content"]:
-                        if ele.get("type") == "video":
-                            ele["fps"] = 0.5
-                            ele["max_frames"] = 50
+            # videos.append(self.video_cache[video_path]["video"])
+            # audios.append(self.video_cache[video_path]["audio"])
 
-                            video_path = ele["video"]
+            audios_, _, videos_ = process_mm_info(
+                    conversation, use_audio_in_video=False
+                )
 
-                            # ---------- 使用缓存 ----------
-                            if video_path not in self.video_cache:
-                                audios_, _, videos_ = process_mm_info(
-                                    conversation, use_audio_in_video=False
-                                )
-                                self.video_cache[video_path] = {
-                                    "video": videos_[0] if videos_ else None,
-                                    "audio": audios_[0] if audios_ else None,
-                                }
+            videos.append(videos_[0] if videos_ else None)
+            audios.append(audios_[0] if audios_ else None)
 
-                            video_tensor = self.video_cache[video_path]["video"]
-                            audio_tensor = self.video_cache[video_path]["audio"]
-
-
-            # audios_, _, videos_ = process_mm_info(
-            #     conversation, use_audio_in_video=True
-            # )
-
-            # videos.append(videos_[0] if videos_ else None)
-            # audios.append(audios_[0] if audios_ else None)
-
-            videos.append(video_tensor)
-            audios.append(audio_tensor)
-
-
-        # ---------- 4. 一次性 processor ----------
         batch = self.processor(
             text=texts,
             videos=videos,
             audio=audios,
             padding=True,
             return_tensors="pt",
-            use_audio_in_video=False
+            use_audio_in_video=False,
         )
 
-
-        labels = batch["input_ids"].clone()
-        labels[:] = -100
-
-        im_start_id = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
-        assistant_id = self.tokenizer.convert_tokens_to_ids("assistant")
-        im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-
-        for b in range(labels.size(0)):
-            input_ids = batch["input_ids"][b]
-
-            start = None
-            for i in range(len(input_ids) - 1):
-                if input_ids[i] == im_start_id and input_ids[i + 1] == assistant_id:
-                    start = i + 3
-                    break
-
-            if start is None:
-                raise RuntimeError("No <|im_start|> assistant found")
-
-            end = None
-            for i in range(start, len(input_ids)):
-                if input_ids[i] == im_end_id:
-                    end = i
-                    break
-
-            if end is None:
-                end = len(input_ids)
-
-            labels[b, start:end] = input_ids[start:end]
+        labels = torch.stack([
+            self._build_labels(ids)
+            for ids in batch["input_ids"]
+        ])
 
         batch["labels"] = labels
-
-        print(batch["labels"])
-
-        print(batch["video_grid_thw"].shape) 
-
-        print(batch["pixel_values_videos"].shape) 
-        for k, v in batch.items(): 
-            if isinstance(v, torch.Tensor): 
-                print(k, v.shape, v.numel() * v.element_size() / 1024**3, "GB")
-
         return batch
+
 
 
 train_dataset = OmniVideoConversationDataset(
@@ -316,10 +298,10 @@ args = TrainingArguments(
     save_strategy="epoch",
     learning_rate=1e-4,
     per_device_train_batch_size=batch_size,
-    gradient_accumulation_steps=2,
+    gradient_accumulation_steps=1,
     bf16=True,
     fp16=False,
-    num_train_epochs=2,
+    num_train_epochs=1,
     logging_steps=5,
     load_best_model_at_end=False,
 )
@@ -332,6 +314,7 @@ trainer = Trainer(
     train_dataset=train_dataset,
     data_collator=data_collator,
 )
+
 
 trainer.train()
 
