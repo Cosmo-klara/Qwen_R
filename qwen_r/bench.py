@@ -2,6 +2,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+import torch.nn as nn
 import copy
 from transformers import TrainingArguments, Trainer
 from peft import LoraConfig, get_peft_model
@@ -13,6 +14,49 @@ from qwen_omni_utils import process_mm_info
 import json
 from torch.utils.data import Dataset
 from transformers.image_utils import SizeDict
+
+class OmniStepMemoryTracker:
+    def __init__(self, log_every=1):
+        self.step = 0
+        self.log_every = log_every
+
+    def log(self, batch):
+        if self.step % self.log_every != 0:
+            self.step += 1
+            return
+
+        torch.cuda.synchronize()
+
+        alloc = torch.cuda.memory_allocated() / 1024**2
+        reserve = torch.cuda.memory_reserved() / 1024**2
+        peak = torch.cuda.max_memory_allocated() / 1024**2
+
+        # ---------- text ----------
+        seq_len = batch["input_ids"].shape[1]
+        label_tokens = (batch["labels"] != -100).sum().item()
+
+        # ---------- video ----------
+        if "video_grid_thw" in batch:
+            t, h, w = batch["video_grid_thw"][0].tolist()
+            video_tokens = t * h * w
+        else:
+            t = h = w = video_tokens = 0
+
+        # ---------- audio ----------
+        if "input_features" in batch:
+            audio_tokens = batch["input_features"].shape[-1]
+        else:
+            audio_tokens = 0
+
+        print(
+            f"[Step {self.step:05d}] "
+            f"seq={seq_len}, label={label_tokens} | "
+            f"video={t}x{h}x{w}={video_tokens} | "
+            f"audio={audio_tokens} | "
+            f"CUDA alloc={alloc:.1f}MB peak={peak:.1f}MB reserve={reserve:.1f}MB"
+        )
+
+        self.step += 1
 
 def replace_time_tokens_with_percentage(text, time_map, duration):
 
@@ -57,7 +101,6 @@ class OmniVideoConversationDataset(Dataset):
             "time_map": time_map,
         }
 
-
 class QwenOmniDataCollator:
     def __init__(self, processor):
         self.processor = processor
@@ -88,15 +131,19 @@ class QwenOmniDataCollator:
                 cur = []
         return rounds
 
-    def _truncate_by_round(
+    def _truncate_by_round_with_labels(
         self,
         base_chat,          # system + video/audio
         rounds,             # [[h,g], [h,g], ...]
-        max_length
+        max_total_tokens    # input + label 最大 token 数
     ):
+        rounds = copy.deepcopy(rounds)
+
         while True:
             chat = copy.deepcopy(base_chat)
 
+            # 统计 label token
+            total_tokens = 0
             for r in rounds:
                 for t in r:
                     role = "user" if t["from"] == "human" else "assistant"
@@ -105,17 +152,29 @@ class QwenOmniDataCollator:
                         "content": [{"type": "text", "text": t["value"]}],
                     })
 
+            # 用 tokenizer 计算 input token 长度
             prompt = self.processor.apply_chat_template(
                 chat, tokenize=False, add_generation_prompt=False
             )
+            input_tokens = len(self.tokenizer(prompt).input_ids)
 
-            token_len = len(self.tokenizer(prompt).input_ids)
+            # 统计 label token
+            label_tokens = 0
+            for r in rounds:
+                for t in r:
+                    if t["from"] == "gpt":  # 只计算 assistant 输出
+                        label_tokens += len(self.tokenizer(t["value"]).input_ids)
 
-            if token_len <= max_length or len(rounds) <= 1:
+            total_tokens = input_tokens + label_tokens
+            print(input_tokens, label_tokens)
+
+            # 如果总长度符合限制，或者只剩最后一轮，返回
+            if total_tokens <= max_total_tokens:
                 return chat
 
             # ❗ 删除最早的一整轮
             rounds = rounds[1:]
+
 
     def _build_conversation(self, sample):
         conversations = self._replace_time_tokens(
@@ -140,14 +199,13 @@ class QwenOmniDataCollator:
 
         rounds = self._split_rounds(conversations)
 
-        chat = self._truncate_by_round(
+        chat = self._truncate_by_round_with_labels(
             base_chat=base_chat,
             rounds=rounds,
-            max_length=self.tokenizer.model_max_length,
+            max_total_tokens=2304
         )
 
         return chat
-
 
     def _build_labels(self, input_ids):
         labels = input_ids.clone()
@@ -183,19 +241,6 @@ class QwenOmniDataCollator:
             )
             texts.append(prompt)
 
-            # video_path = sample["video_path"]
-            # if video_path not in self.video_cache:
-            #     audios_, _, videos_ = process_mm_info(
-            #         conversation, use_audio_in_video=False
-            #     )
-            #     self.video_cache[video_path] = {
-            #         "video": videos_[0],
-            #         "audio": audios_[0],
-            #     }
-
-            # videos.append(self.video_cache[video_path]["video"])
-            # audios.append(self.video_cache[video_path]["audio"])
-
             audios_, _, videos_ = process_mm_info(
                     conversation, use_audio_in_video=False
                 )
@@ -217,7 +262,50 @@ class QwenOmniDataCollator:
             for ids in batch["input_ids"]
         ])
 
+        label_tokens = (labels != -100).sum().item()
+        print("label tokens:", label_tokens)
+
+
         batch["labels"] = labels
+
+        if not hasattr(self, "_debug_printed"):
+            # self._debug_printed = True
+
+            print("\n========== Omni Batch Debug ==========")
+
+            # ---------- Text ----------
+            print("[Text]")
+            print("input_ids:", batch["input_ids"].shape)
+            print("attention_mask:", batch["attention_mask"].shape)
+            print("labels:", batch["labels"].shape)
+            print(
+                "label tokens:",
+                (batch["labels"] != -100).sum().item()
+            )
+
+            # ---------- Video ----------
+            if "pixel_values_videos" in batch:
+                pv = batch["pixel_values_videos"]
+                print("\n[Video]")
+                print("pixel_values_videos:", pv.shape)
+                print("dtype:", pv.dtype)
+                print("video_grid_thw:", batch.get("video_grid_thw"))
+
+                video_mem = pv.numel() * pv.element_size() / 1024**2
+                print(f"video tensor size: {video_mem:.2f} MB")
+
+            # ---------- Audio ----------
+            for k in batch.keys():
+                if "audio" in k or "input_features" in k:
+                    v = batch[k]
+                    if isinstance(v, torch.Tensor):
+                        mem = v.numel() * v.element_size() / 1024**2
+                        print("\n[Audio]")
+                        print(f"{k}: {v.shape}, {mem:.2f} MB")
+
+            print("=====================================\n")
+
+
         return batch
 
 
@@ -301,20 +389,37 @@ args = TrainingArguments(
     gradient_accumulation_steps=1,
     bf16=True,
     fp16=False,
-    num_train_epochs=1,
+    fp16_full_eval=False,
+    num_train_epochs=2,
     logging_steps=5,
     load_best_model_at_end=False,
 )
 
 data_collator = QwenOmniDataCollator(processor)
 
-trainer = Trainer(
+class DebugTrainer(Trainer):
+    def __init__(self, *args, memory_tracker=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.memory_tracker = memory_tracker
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        if self.memory_tracker is not None:
+            self.memory_tracker.log(inputs)
+
+        return super().training_step(model, inputs, *args, **kwargs)
+
+
+
+memory_tracker = OmniStepMemoryTracker(log_every=1)
+
+
+trainer = DebugTrainer(
     model=model,
     args=args,
     train_dataset=train_dataset,
     data_collator=data_collator,
+    memory_tracker=memory_tracker,
 )
-
 
 trainer.train()
 

@@ -1,212 +1,96 @@
-### exp2
+发现 transformers 在模型的 forward 中直接调用了 self.loss_function
 
-固定均匀采样 100 帧 + 真实时间重映射()
-
-Qwen2.5-omni 使用 TM-RoPE，也就是说依赖于：(token_index, physical_time)。其中 physical_time 就来自视频元信息。
-
-每个 video token 都隐式绑定一个时间长度：
-
-second_per_grid_ts = [ video_processor.temporal_patch_size / fps ] * num_video_grids
-
-second_per_grid_ts = [self.video_processor.temporal_patch_size / fps] * len(video_grid_thw)
-
-len(video_grid_thw)： video time-chunks 的数量
-
-也就是：
-
-“这个 token 覆盖了现实世界中多少秒”
-
-TM-RoPE 用它来算 真实时间轴上的相位偏移。
-
-```python
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
-import torch
-
-from transformers import TrainingArguments, Trainer
-from peft import LoraConfig, get_peft_model
-from modelscope import snapshot_download
-from modelscope import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor, Qwen2_5OmniThinkerForConditionalGeneration
-
-from transformers.models.qwen2_vl.video_processing_qwen2_vl import Qwen2VLVideoProcessor
-from transformers.video_utils import VideoMetadata
-from typing import Optional
-from qwen_omni_utils import process_mm_info
-import json
-from torch.utils.data import Dataset
-from transformers.image_utils import SizeDict
-
-class FixedResQwen2VLVideoProcessor(Qwen2VLVideoProcessor):
-    def _preprocess(
-        self, videos, do_resize=True, size=None, interpolation=None, **kwargs
-    ):
-        # 固定分辨率
-        fixed_size = SizeDict(height=224, width=224)
-        for i, video in enumerate(videos):
-            videos[i] = self.resize(video, size=fixed_size, interpolation=interpolation)
-        return super()._preprocess(videos, do_resize=False, size=fixed_size, interpolation=interpolation, **kwargs)
-
-class OmniVideoConversationDataset(Dataset):
-    def __init__(
-        self,
-        json_path: str,
-        video_root: str,
-    ):
-        with open(json_path, "r") as f:
-            self.data = json.load(f)
-
-        self.video_root = video_root
-
-    def __len__(self):
-        return len(self.data)
-
-    def _build_text(self, conversations):
-        messages = []
-        for turn in conversations:
-            if turn["from"] == "human":
-                role = "user"
-            elif turn["from"] == "gpt":
-                role = "assistant"
-            else:
-                continue
-
-            messages.append({
-                "role": role,
-                "content": turn["value"]
-            })
-
-        return messages
-
-    def __getitem__(self, idx):
-        sample = self.data[idx]
-        messages = self._build_text(sample["conversations"])
-        video_id = sample["id"]
-        video_path = os.path.join(self.video_root, f"{video_id}.mp4")
-
-        return {
-            "text": messages,
-            "videos": [video_path],
-        }
-
-def build_prompt(messages):
-    prompt = ""
-    for m in messages:
-        if m["role"] == "user":
-            prompt += f"<human>{m['content']}</human>"
-        elif m["role"] == "assistant":
-            prompt += f"<gpt>{m['content']}</gpt>"
-    return prompt
-
-class QwenOmniDataCollator:
-    def __init__(self, processor):
-        self.processor = processor
-
-    def __call__(self, features):
-        texts = [build_prompt(f["text"]) for f in features]
-        print(texts[0])
-
-        # 视频路径列表
-        videos = [f["videos"][0] if f.get("videos") else None for f in features]
-
-        batch = self.processor(
-            text=texts,
-            videos=videos,
-            padding=True,
-            return_tensors="pt",
-            use_audio_in_video=True,
+```py
+    loss = None
+    if labels is not None:
+        loss = self.loss_function(
+            logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
         )
+```
+ 
+往上定位 self.loss_funciton 的实现时，发现其定义在父类 PreTrainedModel 中( src/transformers/modeling_utils.py 内)：
 
-        print(batch["video_grid_thw"].shape)
-        print(batch["pixel_values_videos"].shape)
-        
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                print(k, v.shape, v.numel() * v.element_size() / 1024**3, "GB")
-
-        return batch
-
-train_dataset = OmniVideoConversationDataset(
-    json_path="../../LongVALE/data/longvale-sft-bp-7k.json",
-    video_root="../../LongVALE/raw_videos_train/video_train_7240/"
-)
-
-model_path = snapshot_download(
-    'Qwen/Qwen2.5-Omni-3B',
-    cache_dir="../../Qwen/cache/modelscope"
-)
-
-model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-    model_path,
-    dtype=torch.bfloat16,
-    device_map="balanced",
-    trust_remote_code=True,
-    use_safetensors=True
-)
-
-video_processor = FixedResQwen2VLVideoProcessor.from_pretrained(model_path)
-video_processor.do_sample_frames = True
-video_processor.fps = 2.0
-
-processor = Qwen2_5OmniProcessor.from_pretrained(
-    model_path,
-    video_processor=video_processor,
-)
-
-config = LoraConfig(
-    r=16,
-    lora_alpha=16,
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "up_proj", "down_proj"],
-    # target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0.05,
-    bias="none",
-)
-
-model = get_peft_model(model, config)
-
-for name, param in model.named_parameters():
-    if (
-        "audio_tower" in name
-        or "visual" in name
-    ):
-        param.requires_grad = False
-model.gradient_checkpointing_enable()
-model.config.use_cache = False
-
-model.print_trainable_parameters()
-
-batch_size = 1
-
-args = TrainingArguments(
-    output_dir="./r_models",
-    remove_unused_columns=False,
-    eval_strategy="no",
-    save_strategy="epoch",
-    learning_rate=1e-4,
-    per_device_train_batch_size=batch_size,
-    gradient_accumulation_steps=2,
-    # per_device_eval_batch_size=batch_size,
-    bf16=True,
-    num_train_epochs=2, # 5 -> 2
-    logging_steps=5,
-    load_best_model_at_end=False,
-    label_names=["labels"],
-)
-
-data_collator = QwenOmniDataCollator(processor)
-
-trainer = Trainer(
-    model=model,
-    # model=model.thinker,
-    args=args,
-    train_dataset=train_dataset,
-    processing_class=processor,
-    data_collator=data_collator,
-)
+```py
+class Qwen2_5OmniPreTrainedModel(PreTrainedModel):
+class Qwen2_5OmniPreTrainedModelForConditionalGeneration(Qwen2_5OmniPreTrainedModel):
+class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForConditionalGeneration, GenerationMixin):
 ```
 
+```py
+    @property
+    def loss_function(self):
+        if hasattr(self, "_loss_function"):
+            return self._loss_function
 
+        loss_type = getattr(self, "loss_type", None)
 
+        if loss_type is None or loss_type not in LOSS_MAPPING:
+            logger.warning_once(
+                f"`loss_type={loss_type}` was set in the config but it is unrecognized. "
+                f"Using the default loss: `ForCausalLMLoss`."
+            )
+            loss_type = "ForCausalLM"
+        return LOSS_MAPPING[loss_type]
 
+    @loss_function.setter
+    def loss_function(self, value):
+        self._loss_function = value
+```
 
+首先会检测是否包含 _loss_function 属性，如果存在该属性，则直接使用 self._loss_function 自定义定义的损失函数；
+
+然后没有自定义损失函数的话就通过 LOSS_MAPPING 字典映射，找 loss_type 对应的损失函数；如果 loss_type 不在 LOSS_MAPPING 中或者 loss_type 为 None，默认使用 “ForCausalLM” 对应的损失函数
+
+在 LOSS_MAPPING 中找 "ForCausalLM": ForCausalLMLoss, 实现如下：
+
+```py
+def ForCausalLMLoss(
+    logits,
+    labels,
+    vocab_size: int,
+    num_items_in_batch: torch.Tensor | None = None,
+    ignore_index: int = -100,
+    shift_labels: torch.Tensor | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    # Upcast to float if we need to compute the loss to avoid potential precision issues
+    logits = logits.float()
+
+    if shift_labels is None:
+        # Shift so that tokens < n predict n
+        labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
+        shift_labels = labels[..., 1:].contiguous()
+
+    # Flatten the tokens
+    logits = logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+    shift_labels = shift_labels.to(logits.device)
+    loss = fixed_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
+    return loss
+```
+
+其中 fixed_cross_entropy 实现如下：
+
+```py
+def fixed_cross_entropy(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    num_items_in_batch: torch.Tensor | None = None,
+    ignore_index: int = -100,
+    **kwargs,
+) -> torch.Tensor:
+    reduction = "sum" if num_items_in_batch is not None else "mean"
+    loss = nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction=reduction)
+    if reduction == "sum":
+        # just in case users pass an int for num_items_in_batch, which could be the case for custom trainer
+        if torch.is_tensor(num_items_in_batch):
+            num_items_in_batch = num_items_in_batch.to(loss.device)
+        loss = loss / num_items_in_batch
+    return loss
+```
+
+可以看到没有做优化之类的；或许可以参照 [cce](https://github.com/apple/ml-cross-entropy) 或者 [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) 里面提到的减少训练显存的使用；
+
+后面发现 transformers 已经支持了 Liger-Kernel，需要在 TrainingArguments 中启用，还有就是可以开 torch_compile=True ；等跑完一轮试试
 
 
